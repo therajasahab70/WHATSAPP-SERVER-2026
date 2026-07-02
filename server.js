@@ -102,7 +102,6 @@ async function initWhatsApp() {
 
 initWhatsApp();
 
-// 🔥 FIX: Yahan se delete wala logic hata diya gaya hai jisse baar baar QR change na ho
 app.get('/get-qr', (req, res) => {
     res.json({ status: connectionStatus, qr: latestQr });
 });
@@ -148,6 +147,12 @@ app.post('/send-bulk', upload.single('file'), async (req, res) => {
 
                 try {
                     let cleanReceiverPhone = contact.phone.replace(/[^0-9]/g, '');
+                    
+                    // 🔥 FIX 1: Agar number 10 digit ka hai, toh India ka code '91' jodein
+                    if (cleanReceiverPhone.length === 10) {
+                        cleanReceiverPhone = "91" + cleanReceiverPhone;
+                    }
+
                     const formattedPhone = `${cleanReceiverPhone}@s.whatsapp.net`;
                     
                     let personalizedMessage = "";
@@ -157,10 +162,11 @@ app.post('/send-bulk', upload.single('file'), async (req, res) => {
                     // Message bhejna
                     await sock.sendMessage(formattedPhone, { text: personalizedMessage });
                     
-                    sendLog(`📩 Message bheja gaya: ${contact.name} ko.`);
+                    sendLog(`📩 Message bheja gaya: ${contact.name} (${cleanReceiverPhone}) ko.`);
                     await delay(waitSeconds); 
                 } catch (error) {
-                    sendLog(`❌ ERROR: ${contact.name} ko bhejne me fail.`);
+                    // 🔥 FIX 2: Asli error log karna taaki asli wajah pata chale
+                    sendLog(`❌ ERROR: ${contact.name} ko fail. Detail: ${error.message || "Unknown error"}`);
                 }
             }
             
