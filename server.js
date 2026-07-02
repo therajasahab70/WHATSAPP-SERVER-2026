@@ -15,24 +15,23 @@ app.use(express.urlencoded({ extended: true }));
 let sock = null;
 let latestQr = null;
 let connectionStatus = "Initializing...";
+let isCampaignRunning = false; // Campaign status track karne ke liye
 
 app.get('/', (req, res) => {
     res.sendFile(path.join(__dirname, 'index.html'));
 });
 
 async function initWhatsApp() {
-    console.log("Starting Fresh WhatsApp Initialization...");
+    console.log("Starting WhatsApp Initialization...");
     const { state, saveCreds } = await useMultiFileAuthState('auth_info_baileys');
     
-    // WhatsApp ka latest web version fetch karein taaki connection block na ho
-    const { version, isLatest } = await fetchLatestBaileysVersion().catch(() => ({ version: [2, 3000, 1015901307], isLatest: true }));
+    const { version } = await fetchLatestBaileysVersion().catch(() => ({ version: [2, 3000, 1015901307] }));
 
     sock = makeWASocket({
         version,
         auth: state,
         logger: pino({ level: 'silent' }),
-        // Yeh browser string bilkul official web app ki tarah treat hota hai
-        browser: ["Ubuntu", "Chrome", "20.0.04"],
+        browser: ["Mac OS", "Chrome", "123.0.0.0"],
         printQRInTerminal: false,
         mobile: false,
         keepAliveIntervalMs: 30000,
@@ -45,7 +44,7 @@ async function initWhatsApp() {
         const { connection, lastDisconnect, qr } = update;
         
         if (qr) {
-            console.log("🎯 QR Code Generated Successfully!");
+            console.log("🎯 Live QR Code Generated!");
             try {
                 latestQr = await QRCode.toDataURL(qr);
                 connectionStatus = "QR Ready";
@@ -56,39 +55,45 @@ async function initWhatsApp() {
 
         if (connection === 'close') {
             const statusCode = lastDisconnect?.error?.output?.statusCode;
-            const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
-            console.log(`Connection closed (Status: ${statusCode}). Reconnecting: ${shouldReconnect}`);
+            console.log(`Connection closed (Status: ${statusCode})`);
             
             connectionStatus = "Disconnected";
             latestQr = null;
-            
-            // Agar purana session corrupt ho gaya ho, toh use clear karke restart karein
-            if (statusCode === DisconnectReason.badSession || statusCode === 405) {
-                console.log("Bad session/Method not allowed detected. Cleaning cache...");
+            isCampaignRunning = false;
+
+            // 🔥 FIX: Agar logged out ya bad session hai, toh files delete karke fresh QR laayein
+            if (statusCode === DisconnectReason.loggedOut || statusCode === 401 || statusCode === 405) {
+                console.log("Session cleared. Generating fresh QR...");
                 try { fs.rmSync('auth_info_baileys', { recursive: true, force: true }); } catch(e) {}
             }
-
-            if (shouldReconnect) {
-                setTimeout(() => { initWhatsApp(); }, 5000); // 5 seconds baad automatic fresh try
-            }
+            
+            setTimeout(() => { initWhatsApp(); }, 3000); // Auto restart socket
         } else if (connection === 'open') {
             console.log("✅ WhatsApp successfully connected!");
             connectionStatus = "Connected";
-            latestQr = null;
+            latestQr = null; // Connect hone ke baad QR clean
         }
     });
 }
 
-// Start core logic
+// Start WhatsApp on App Start
 initWhatsApp();
 
+// Frontend status polling route
 app.get('/get-qr', (req, res) => {
+    // 🔥 FIX: Agar user page refresh kare aur status connected na ho, toh purana session flush karke naya QR trigger ho
+    if (connectionStatus === "Disconnected" || (!latestQr && connectionStatus !== "Connected")) {
+        try { fs.rmSync('auth_info_baileys', { recursive: true, force: true }); } catch(e) {}
+        connectionStatus = "Initializing...";
+        initWhatsApp();
+    }
     res.json({
         status: connectionStatus,
         qr: latestQr
     });
 });
 
+// Bulk Message Sender with Infinite Repeat Loop
 app.post('/send-bulk', upload.single('file'), async (req, res) => {
     const { data, messageTemplate, delayTime } = req.body;
     const file = req.file;
@@ -100,27 +105,46 @@ app.post('/send-bulk', upload.single('file'), async (req, res) => {
     const contactList = JSON.parse(data); 
     const waitSeconds = parseInt(delayTime) * 1000;
 
-    res.json({ status: "Campaign shuru ho gaya hai!" });
+    res.json({ status: "Campaign shuru ho gaya hai! Yeh loop me lagatar chalta rahega." });
+    
+    isCampaignRunning = true;
 
-    for (let contact of contactList) {
-        try {
-            let cleanReceiverPhone = contact.phone.replace(/[^0-9]/g, '');
-            const formattedPhone = `${cleanReceiverPhone}@s.whatsapp.net`;
-            const personalizedMessage = `${contact.name}, ${messageTemplate}`;
-
-            if (file) {
-                await sock.sendMessage(formattedPhone, {
-                    document: { url: file.path },
-                    fileName: file.originalname,
-                    caption: personalizedMessage
-                });
-            } else {
-                await sock.sendMessage(formattedPhone, { text: personalizedMessage });
+    // 🔥 LOOP SYSTEM: Infinite loop jab tak aap server stop na karein
+    while (isCampaignRunning) {
+        console.log("🔄 Starting message campaign loop...");
+        
+        for (let contact of contactList) {
+            // Agar beech me WhatsApp disconnect ho jaye toh loop break ho jaye
+            if (connectionStatus !== "Connected") {
+                console.log("WhatsApp disconnected. Stopping loop.");
+                isCampaignRunning = false;
+                break;
             }
-            await delay(waitSeconds);
-        } catch (error) {
-            console.error(`Failed to send to ${contact.name}:`, error);
+
+            try {
+                let cleanReceiverPhone = contact.phone.replace(/[^0-9]/g, '');
+                const formattedPhone = `${cleanReceiverPhone}@s.whatsapp.net`;
+                const personalizedMessage = `${contact.name}, ${messageTemplate}`;
+
+                if (file) {
+                    await sock.sendMessage(formattedPhone, {
+                        document: { url: file.path },
+                        fileName: file.originalname,
+                        caption: personalizedMessage
+                    });
+                } else {
+                    await sock.sendMessage(formattedPhone, { text: personalizedMessage });
+                }
+
+                console.log(`[Loop Active] Message sent to ${contact.name}`);
+                await delay(waitSeconds); // User defined delay
+            } catch (error) {
+                console.error(`Failed to send to ${contact.name}:`, error);
+            }
         }
+        
+        // Ek round khatam hone par 5 second ka pause lekar agla round shuru karega
+        await delay(5000); 
     }
 
     if (file) {
