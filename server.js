@@ -1,6 +1,6 @@
 const express = require('express');
 const multer = require('multer');
-const { default: makeWASocket, useMultiFileAuthState, delay } = require('@whiskeysockets/baileys');
+const { default: makeWASocket, useMultiFileAuthState, delay, DisconnectReason } = require('@whiskeysockets/baileys');
 const pino = require('pino');
 const QRCode = require('qrcode');
 const fs = require('fs');
@@ -14,21 +14,23 @@ app.use(express.urlencoded({ extended: true }));
 
 let sock = null;
 let latestQr = null;
-let connectionStatus = "Disconnected";
+let connectionStatus = "Initializing...";
 
-// Static Dashboard Serve Karein
 app.get('/', (req, res) => {
     res.sendFile(path.join(__dirname, 'index.html'));
 });
 
-// WhatsApp Socket Initialization aur QR Generation Logic
 async function initWhatsApp() {
+    console.log("Starting WhatsApp Initialization...");
     const { state, saveCreds } = await useMultiFileAuthState('auth_info_baileys');
     
     sock = makeWASocket({
         auth: state,
         logger: pino({ level: 'silent' }),
-        browser: ["Mac OS", "Chrome", "123.0.0.0"]
+        browser: ["Mac OS", "Chrome", "123.0.0.0"],
+        connectTimeoutMs: 60000,
+        defaultQueryTimeoutMs: 0,
+        keepAliveIntervalMs: 10000
     });
 
     sock.ev.on('creds.update', saveCreds);
@@ -37,7 +39,7 @@ async function initWhatsApp() {
         const { connection, lastDisconnect, qr } = update;
         
         if (qr) {
-            // QR Code ko Base64 Image string me convert karein taaki HTML me dikh sake
+            console.log("New QR Code Generated!");
             try {
                 latestQr = await QRCode.toDataURL(qr);
                 connectionStatus = "QR Ready";
@@ -47,22 +49,24 @@ async function initWhatsApp() {
         }
 
         if (connection === 'close') {
-            console.log("Connection closed, reconnecting...");
+            const shouldReconnect = (lastDisconnect?.error)?.output?.statusCode !== DisconnectReason.loggedOut;
+            console.log("Connection closed due to ", lastDisconnect?.error, ", reconnecting: ", shouldReconnect);
             connectionStatus = "Disconnected";
             latestQr = null;
-            initWhatsApp(); // Auto reconnect
+            if (shouldReconnect) {
+                initWhatsApp();
+            }
         } else if (connection === 'open') {
             console.log("WhatsApp Successfully Connected!");
             connectionStatus = "Connected";
-            latestQr = null; // Connect hone ke baad QR hata dein
+            latestQr = null;
         }
     });
 }
 
-// App start hote hi WhatsApp trigger karein
+// Initialize on start
 initWhatsApp();
 
-// Frontend ke liye Status aur QR ka API Endpoint
 app.get('/get-qr', (req, res) => {
     res.json({
         status: connectionStatus,
@@ -70,19 +74,18 @@ app.get('/get-qr', (req, res) => {
     });
 });
 
-// Bulk Message & File Sender
 app.post('/send-bulk', upload.single('file'), async (req, res) => {
     const { data, messageTemplate, delayTime } = req.body;
     const file = req.file;
 
     if (connectionStatus !== "Connected") {
-        return res.status(400).json({ error: "Pehle WhatsApp QR Code scan karke device link karein." });
+        return res.status(400).json({ error: "Pehle WhatsApp QR Code scan karein." });
     }
 
     const contactList = JSON.parse(data); 
     const waitSeconds = parseInt(delayTime) * 1000;
 
-    res.json({ status: "Campaign shuru ho gaya hai! Background me messages jaa rahe hain." });
+    res.json({ status: "Campaign shuru ho gaya hai!" });
 
     for (let contact of contactList) {
         try {
@@ -99,8 +102,6 @@ app.post('/send-bulk', upload.single('file'), async (req, res) => {
             } else {
                 await sock.sendMessage(formattedPhone, { text: personalizedMessage });
             }
-
-            console.log(`Message sent to ${contact.name}`);
             await delay(waitSeconds);
         } catch (error) {
             console.error(`Failed to send to ${contact.name}:`, error);
