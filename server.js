@@ -1,6 +1,6 @@
 const express = require('express');
 const multer = require('multer');
-const { default: makeWASocket, useMultiFileAuthState, delay } = require('@whiskeysockets/baileys');
+const { default: makeWASocket, useMultiFileAuthState, delay, DisconnectReason } = require('@whiskeysockets/baileys');
 const pino = require('pino');
 const fs = require('fs');
 const path = require('path');
@@ -11,44 +11,55 @@ const upload = multer({ dest: 'uploads/' });
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-let sock;
+let sock = null;
 
-// Static dashboard ko serve karne ke liye
 app.get('/', (req, res) => {
     res.sendFile(path.join(__dirname, 'index.html'));
 });
 
-// 1. WhatsApp Link karne ke liye Pair Code Generator
+// 1. Pair Code Generator Route
 app.get('/get-pair-code', async (req, res) => {
-    const phone = req.query.phone;
+    let phone = req.query.phone;
     if (!phone) return res.status(400).json({ error: "Phone number jaroori hai." });
+
+    // Number ko bilkul clean karein (no spaces, no +)
+    phone = phone.replace(/[^0-9]/g, '');
+
+    // Agar pehle se koi connection chal raha hai toh use close karein
+    if (sock) {
+        try { sock.logout(); } catch(e){}
+    }
 
     const { state, saveCreds } = await useMultiFileAuthState('auth_info_baileys');
     
     sock = makeWASocket({
         auth: state,
         logger: pino({ level: 'silent' }),
-        // Desktop browser string taaki mobile me "Link with phone number" smoothly work kare
-        browser: ["Mac OS", "Chrome", "123.0.0.0"]
+        browser: ["Mac OS", "Chrome", "123.0.0.0"],
+        connectTimeoutMs: 60000,
+        defaultQueryTimeoutMs: 0,
+        keepAliveIntervalMs: 10000
     });
 
     sock.ev.on('creds.update', saveCreds);
 
-    if (!sock.authState.creds.registered) {
-        setTimeout(async () => {
-            try {
+    // Jab tak credentials register na ho, thoda ruk kar code generate karein
+    setTimeout(async () => {
+        try {
+            if (!sock.authState.creds.registered) {
                 let code = await sock.requestPairingCode(phone);
                 res.json({ code: code });
-            } catch (err) {
-                res.status(500).json({ error: "Pairing code generate nahi ho paya." });
+            } else {
+                res.json({ message: "Device already connected!" });
             }
-        }, 3000);
-    } else {
-        res.json({ message: "Device pehle se connected hai!" });
-    }
+        } catch (err) {
+            console.error("Pairing Error:", err);
+            res.status(500).json({ error: "Code generate nahi ho paya. Refresh karke try karein." });
+        }
+    }, 4000); // 4 seconds ka wait taaki socket stable ho jaye
 });
 
-// 2. Bulk Message & File Sender
+// 2. Bulk Message Sender
 app.post('/send-bulk', upload.single('file'), async (req, res) => {
     const { data, messageTemplate, delayTime } = req.body;
     const file = req.file;
@@ -58,35 +69,29 @@ app.post('/send-bulk', upload.single('file'), async (req, res) => {
     const contactList = JSON.parse(data); 
     const waitSeconds = parseInt(delayTime) * 1000;
 
-    // Background me sending complete hogi, response turant user ko bhej rahe hain
-    res.json({ status: "Campaign shuru ho gaya hai! Background me messages jaa rahe hain." });
+    res.json({ status: "Campaign shuru ho gaya hai!" });
 
     for (let contact of contactList) {
         try {
-            const formattedPhone = `${contact.phone}@s.whatsapp.net`;
-            // Naam pehle aayega, uske baad message text
+            let cleanReceiverPhone = contact.phone.replace(/[^0-9]/g, '');
+            const formattedPhone = `${cleanReceiverPhone}@s.whatsapp.net`;
             const personalizedMessage = `${contact.name}, ${messageTemplate}`;
 
             if (file) {
-                // Agar file attached hai
                 await sock.sendMessage(formattedPhone, {
                     document: { url: file.path },
                     fileName: file.originalname,
                     caption: personalizedMessage
                 });
             } else {
-                // Sirf text message
                 await sock.sendMessage(formattedPhone, { text: personalizedMessage });
             }
-
-            console.log(`Message sent to ${contact.name}`);
-            await delay(waitSeconds); // Har message ke beech ka gap (Delay)
+            await delay(waitSeconds);
         } catch (error) {
             console.error(`Failed to send to ${contact.name}:`, error);
         }
     }
 
-    // Processing ke baad uploaded temporary file ko delete karna
     if (file) {
         try { fs.unlinkSync(file.path); } catch(e) {}
     }
