@@ -1,5 +1,5 @@
 {
-  "name": "rahul-panchal-whatsapp-message-tool",
+  "name": "whatsapp-message-tool",
   "version": "1.0.0",
   "description": "WhatsApp message tool with pairing code and QR code support",
   "main": "server.js",
